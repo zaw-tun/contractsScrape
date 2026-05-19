@@ -59,8 +59,8 @@ def fetch_fts_notices(updated_from: str, updated_to: str) -> list:
 
     while True:
         params = {
-            "updatedFrom": updated_from,
-            "updatedTo":   updated_to,
+            "updatedFrom": updated_from + "T00:00:00",
+            "updatedTo":   updated_to   + "T23:59:59",
             "limit":       100,
         }
         if cursor:
@@ -324,7 +324,7 @@ def print_summary(notices: list):
 def run_daily_scrape():
     """Main entry point — call this daily."""
     today     = datetime.now().strftime("%Y-%m-%d")
-    from_date = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
     fts_notices = fetch_fts_notices(updated_from=from_date, updated_to=today)
     cf_notices  = fetch_contracts_finder_notices(updated_from=from_date)

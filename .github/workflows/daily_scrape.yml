@@ -38,6 +38,9 @@ jobs:
       - name: Run scraper
         run: python procurement_scraper.py
 
+      - name: Show output files
+        run: ls -la *.csv *.db 2>/dev/null || echo "No output files created"      
+
       - name: Commit results to repo
         run: |
           git config --local user.email "action@github.com"

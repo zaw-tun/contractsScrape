@@ -30,10 +30,7 @@ from datetime import datetime, timedelta, timezone
 # CONFIGURATION — edit these to filter what you care about
 # ─────────────────────────────────────────────────────────────────────────────
 
-KEYWORDS = [
-    "data", "analytics", "artificial intelligence", "AI", "machine learning",
-    "digital", "cloud", "software", "technology", "cyber", "automation"
-]
+KEYWORDS = []
 # Leave empty list [] to fetch ALL notices with no keyword filter
 
 DB_FILE = "procurement.db"          # SQLite database (auto-created)

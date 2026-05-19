@@ -298,7 +298,7 @@ def print_summary(notices: list[dict]):
 def run_daily_scrape():
     """Main function — call this daily."""
     today     = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=28)).strftime("%Y-%m-%d")
 
     # 1. Fetch from both sources
     fts_notices = fetch_fts_notices(

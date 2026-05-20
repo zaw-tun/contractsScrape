@@ -1,21 +1,22 @@
 """
 UK Government Procurement Notice Scraper
 =========================================
-Uses two official government APIs — no scraping, no blocks, no ToS issues.
+Fetches ALL notices from both APIs — no arbitrary caps.
 
 Sources:
-  1. Find a Tender Service (FTS) — OCDS API
-     High-value contracts, central govt, NHS, defence, utilities
-     API: https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages
+  1. Find a Tender Service (FTS) — cursor-based pagination, exhausts all pages
+  2. Contracts Finder — page-number pagination, exhausts all pages
 
-  2. Contracts Finder — OCDS Search API
-     Lower-value contracts, wider public sector
-     API: https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search
-
-Run daily (manually, cron, or GitHub Actions) to build a growing database.
+On a typical day expect:
+  FTS             :  50–300 notices
+  Contracts Finder: 200–800 notices
+  Total           : 300–1,100+ notices per day
 
 Requirements:
     pip install requests pandas
+
+Usage:
+    python procurement_scraper.py        # run and save
 """
 
 import requests
@@ -31,37 +32,49 @@ from datetime import datetime, timedelta, timezone
 # ─────────────────────────────────────────────────────────────────────────────
 
 KEYWORDS = []
-# Set keywords to filter notices, e.g:
+# Filter to matching notices only. Examples:
 # KEYWORDS = ["data", "analytics", "AI", "digital", "cloud", "software"]
-# Leave as [] to fetch ALL notices
+# Leave as [] to fetch ALL notices (recommended — analyse with procurement_analysis.py)
 
-LOOKBACK_DAYS = 1           # how many days back to fetch (1 = yesterday to today)
-DB_FILE       = "procurement.db"
-CSV_PREFIX    = "procurement_latest"
+LOOKBACK_DAYS = 30       # days back to fetch (1 = yesterday to today)
+                        # Increase temporarily to backfill, e.g. 7 or 30
+
+DB_FILE    = "procurement.db"
+CSV_PREFIX = "procurement_latest"
+
+# API page sizes — maximum allowed per request
+FTS_PAGE_SIZE = 100     # FTS max per cursor page
+CF_PAGE_SIZE  = 100     # Contracts Finder max per page
+
+# Polite delay between API calls (seconds)
+API_DELAY = 0.5
 
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def fetch_fts_notices(updated_from: str, updated_to: str) -> list:
     """
-    Fetch notices from Find a Tender Service (FTS) OCDS API.
-    Uses cursor-based pagination.
+    Fetch ALL notices from Find a Tender Service (FTS).
 
-    Correct parameters (as of 2025/2026):
-        updatedFrom, updatedTo, stages, limit, cursor
+    Uses cursor-based pagination — each response returns a 'cursor' token
+    for the next page. Loops until no cursor is returned (= last page).
+
+    Parameters use full datetime format required by FTS API:
+        updatedFrom = "YYYY-MM-DDTHH:MM:SS"
+        updatedTo   = "YYYY-MM-DDTHH:MM:SS"
     """
-    base_url = "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages"
+    base_url    = "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages"
     all_notices = []
-    cursor = None
-    page = 1
+    cursor      = None
+    page        = 1
 
-    print(f"\n[FTS] Fetching notices updated {updated_from} to {updated_to}...")
+    print(f"\n[FTS] Fetching all notices updated {updated_from[:10]} to {updated_to[:10]}...")
 
     while True:
         params = {
-            "updatedFrom": updated_from + "T00:00:00",
-            "updatedTo":   updated_to   + "T23:59:59",
-            "limit":       100,
+            "updatedFrom": updated_from,
+            "updatedTo":   updated_to,
+            "limit":       FTS_PAGE_SIZE,
         }
         if cursor:
             params["cursor"] = cursor
@@ -71,11 +84,11 @@ def fetch_fts_notices(updated_from: str, updated_to: str) -> list:
             response.raise_for_status()
             data = response.json()
         except requests.exceptions.HTTPError as e:
-            print(f"  [FTS] HTTP error on page {page}: {e}")
+            print(f"  [FTS] HTTP {response.status_code} on page {page}: {e}")
             print(f"  [FTS] Response: {response.text[:300]}")
             break
         except requests.RequestException as e:
-            print(f"  [FTS] Request error on page {page}: {e}")
+            print(f"  [FTS] Connection error on page {page}: {e}")
             break
         except json.JSONDecodeError:
             print(f"  [FTS] Could not parse JSON on page {page}")
@@ -83,76 +96,98 @@ def fetch_fts_notices(updated_from: str, updated_to: str) -> list:
 
         releases = data.get("releases", [])
         if not releases:
-            print(f"  [FTS] No releases on page {page} — done")
+            print(f"  [FTS] Page {page}: empty — pagination complete")
             break
 
         for release in releases:
-            tender = release.get("tender", {}) or {}
-            buyer  = release.get("buyer",  {}) or {}
+            notice = _parse_fts_release(release)
+            if notice:
+                all_notices.append(notice)
 
-            classification = tender.get("classification", {})
-            if isinstance(classification, list):
-                cpv = ", ".join([c.get("id", "") for c in classification])
-            elif isinstance(classification, dict):
-                cpv = classification.get("id", "")
-            else:
-                cpv = ""
+        # Check for total count on first page
+        if page == 1:
+            total = data.get("totals", {}).get("total") or data.get("total")
+            if total:
+                est_pages = (total + FTS_PAGE_SIZE - 1) // FTS_PAGE_SIZE
+                print(f"  [FTS] Total available: {total} notices (~{est_pages} pages)")
 
-            value_obj   = tender.get("value",    {}) or {}
-            min_val_obj = tender.get("minValue", {}) or {}
+        print(f"  [FTS] Page {page}: fetched {len(releases)} | Running total: {len(all_notices)}")
 
-            notice = {
-                "source":         "FTS",
-                "notice_id":      (release.get("ocid", "") + "_" + release.get("id", "")),
-                "title":          tender.get("title", ""),
-                "description":    (tender.get("description") or "")[:500],
-                "organisation":   buyer.get("name", ""),
-                "value_low":      min_val_obj.get("amount"),
-                "value_high":     value_obj.get("amount"),
-                "currency":       value_obj.get("currency", "GBP"),
-                "published_date": (release.get("date") or "")[:10],
-                "deadline":       ((tender.get("tenderPeriod") or {}).get("endDate") or "")[:10],
-                "notice_type":    ((release.get("tag") or [""])[0]),
-                "status":         tender.get("status", ""),
-                "cpv_codes":      cpv,
-                "url":            "https://www.find-tender.service.gov.uk/Notice/" + (release.get("id") or ""),
-                "scraped_at":     datetime.now(timezone.utc).isoformat(),
-            }
-            all_notices.append(notice)
-
-        print(f"  [FTS] Page {page}: {len(releases)} notices")
-
+        # Move to next page via cursor
         cursor = data.get("cursor")
         if not cursor:
+            print(f"  [FTS] No cursor returned — all pages fetched")
             break
 
         page += 1
-        time.sleep(0.5)
+        time.sleep(API_DELAY)
 
-    print(f"  [FTS] Total: {len(all_notices)} notices")
+    print(f"  [FTS] Complete: {len(all_notices)} notices fetched")
     return all_notices
+
+
+def _parse_fts_release(release: dict) -> dict:
+    """Extract fields from a single FTS OCDS release."""
+    try:
+        tender = release.get("tender", {}) or {}
+        buyer  = release.get("buyer",  {}) or {}
+
+        classification = tender.get("classification", {})
+        if isinstance(classification, list):
+            cpv = ", ".join(c.get("id", "") for c in classification)
+        elif isinstance(classification, dict):
+            cpv = classification.get("id", "")
+        else:
+            cpv = ""
+
+        value_obj   = tender.get("value",    {}) or {}
+        min_val_obj = tender.get("minValue", {}) or {}
+
+        return {
+            "source":         "FTS",
+            "notice_id":      (release.get("ocid", "") + "_" + release.get("id", "")),
+            "title":          tender.get("title", ""),
+            "description":    (tender.get("description") or "")[:500],
+            "organisation":   buyer.get("name", ""),
+            "value_low":      min_val_obj.get("amount"),
+            "value_high":     value_obj.get("amount"),
+            "currency":       value_obj.get("currency", "GBP"),
+            "published_date": (release.get("date") or "")[:10],
+            "deadline":       ((tender.get("tenderPeriod") or {}).get("endDate") or "")[:10],
+            "notice_type":    ((release.get("tag") or [""])[0]),
+            "status":         tender.get("status", ""),
+            "cpv_codes":      cpv,
+            "url":            "https://www.find-tender.service.gov.uk/Notice/" + (release.get("id") or ""),
+            "scraped_at":     datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        print(f"  [FTS] Parse error on release {release.get('id', '?')}: {e}")
+        return None
 
 
 def fetch_contracts_finder_notices(updated_from: str) -> list:
     """
-    Fetch notices from Contracts Finder OCDS Search API.
-    Correct endpoint as of 2025/2026.
-    """
-    base_url = "https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search"
-    all_notices = []
-    page = 1
+    Fetch ALL notices from Contracts Finder OCDS Search API.
 
-    print(f"\n[Contracts Finder] Fetching notices from {updated_from}...")
+    Uses standard page-number pagination. Reads totalPages from the first
+    response and loops through every page until done.
+    """
+    base_url    = "https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search"
+    all_notices = []
+    page        = 1
+    total_pages = None
+
+    print(f"\n[CF] Fetching all notices from {updated_from}...")
 
     while True:
         params = {
             "publishedFrom": updated_from,
-            "size":          100,
+            "size":          CF_PAGE_SIZE,
             "page":          page,
         }
         headers = {
             "Accept":     "application/json",
-            "User-Agent": "ProcurementResearchBot/1.0",
+            "User-Agent": "UKProcurementResearcher/1.0",
         }
 
         try:
@@ -160,65 +195,86 @@ def fetch_contracts_finder_notices(updated_from: str) -> list:
             response.raise_for_status()
             data = response.json()
         except requests.exceptions.HTTPError as e:
-            print(f"  [CF] HTTP error on page {page}: {e}")
+            print(f"  [CF] HTTP {response.status_code} on page {page}: {e}")
             print(f"  [CF] Response: {response.text[:300]}")
             break
         except requests.RequestException as e:
-            print(f"  [CF] Request error on page {page}: {e}")
+            print(f"  [CF] Connection error on page {page}: {e}")
             break
         except json.JSONDecodeError:
             print(f"  [CF] Could not parse JSON on page {page}")
             break
 
         releases = data.get("releases", [])
+
+        # Capture total pages from first response
+        if page == 1:
+            total_pages = data.get("totalPages", 1)
+            total_count = data.get("totalElements") or data.get("total")
+            if total_count:
+                print(f"  [CF] Total available: {total_count} notices ({total_pages} pages)")
+            else:
+                print(f"  [CF] Total pages: {total_pages}")
+
         if not releases:
-            print(f"  [CF] No releases on page {page} — done")
+            print(f"  [CF] Page {page}: empty — pagination complete")
             break
 
         for release in releases:
-            tender = release.get("tender", {}) or {}
-            buyer  = release.get("buyer",  {}) or {}
+            notice = _parse_cf_release(release)
+            if notice:
+                all_notices.append(notice)
 
-            value_obj   = tender.get("value",    {}) or {}
-            min_val_obj = tender.get("minValue", {}) or {}
+        print(f"  [CF] Page {page}/{total_pages}: fetched {len(releases)} | Running total: {len(all_notices)}")
 
-            classification = tender.get("classification", {})
-            if isinstance(classification, list):
-                cpv = ", ".join([c.get("id", "") for c in classification])
-            elif isinstance(classification, dict):
-                cpv = classification.get("id", "")
-            else:
-                cpv = ""
-
-            notice = {
-                "source":         "Contracts Finder",
-                "notice_id":      (release.get("ocid", "") + "_" + release.get("id", "")),
-                "title":          tender.get("title", ""),
-                "description":    (tender.get("description") or "")[:500],
-                "organisation":   buyer.get("name", ""),
-                "value_low":      min_val_obj.get("amount"),
-                "value_high":     value_obj.get("amount"),
-                "currency":       value_obj.get("currency", "GBP"),
-                "published_date": (release.get("date") or "")[:10],
-                "deadline":       ((tender.get("tenderPeriod") or {}).get("endDate") or "")[:10],
-                "notice_type":    ((release.get("tag") or [""])[0]),
-                "status":         tender.get("status", ""),
-                "cpv_codes":      cpv,
-                "url":            "https://www.contractsfinder.service.gov.uk/Notice/" + (release.get("id") or ""),
-                "scraped_at":     datetime.now(timezone.utc).isoformat(),
-            }
-            all_notices.append(notice)
-
-        total_pages = data.get("totalPages", 1)
-        print(f"  [CF] Page {page}/{total_pages}: {len(releases)} notices")
-
-        if page >= total_pages:
+        if page >= (total_pages or 1):
+            print(f"  [CF] All pages fetched")
             break
-        page += 1
-        time.sleep(0.5)
 
-    print(f"  [CF] Total: {len(all_notices)} notices")
+        page += 1
+        time.sleep(API_DELAY)
+
+    print(f"  [CF] Complete: {len(all_notices)} notices fetched")
     return all_notices
+
+
+def _parse_cf_release(release: dict) -> dict:
+    """Extract fields from a single Contracts Finder OCDS release."""
+    try:
+        tender = release.get("tender", {}) or {}
+        buyer  = release.get("buyer",  {}) or {}
+
+        classification = tender.get("classification", {})
+        if isinstance(classification, list):
+            cpv = ", ".join(c.get("id", "") for c in classification)
+        elif isinstance(classification, dict):
+            cpv = classification.get("id", "")
+        else:
+            cpv = ""
+
+        value_obj   = tender.get("value",    {}) or {}
+        min_val_obj = tender.get("minValue", {}) or {}
+
+        return {
+            "source":         "Contracts Finder",
+            "notice_id":      (release.get("ocid", "") + "_" + release.get("id", "")),
+            "title":          tender.get("title", ""),
+            "description":    (tender.get("description") or "")[:500],
+            "organisation":   buyer.get("name", ""),
+            "value_low":      min_val_obj.get("amount"),
+            "value_high":     value_obj.get("amount"),
+            "currency":       value_obj.get("currency", "GBP"),
+            "published_date": (release.get("date") or "")[:10],
+            "deadline":       ((tender.get("tenderPeriod") or {}).get("endDate") or "")[:10],
+            "notice_type":    ((release.get("tag") or [""])[0]),
+            "status":         tender.get("status", ""),
+            "cpv_codes":      cpv,
+            "url":            "https://www.contractsfinder.service.gov.uk/Notice/" + (release.get("id") or ""),
+            "scraped_at":     datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        print(f"  [CF] Parse error on release {release.get('id', '?')}: {e}")
+        return None
 
 
 def filter_by_keywords(notices: list, keywords: list) -> list:
@@ -228,14 +284,17 @@ def filter_by_keywords(notices: list, keywords: list) -> list:
     keywords_lower = [k.lower() for k in keywords]
     return [
         n for n in notices
-        if any(kw in (n.get("title", "") + " " + n.get("description", "")).lower()
-               for kw in keywords_lower)
+        if any(
+            kw in (n.get("title", "") + " " + n.get("description", "")).lower()
+            for kw in keywords_lower
+        )
     ]
 
 
 def save_to_database(notices: list, db_file: str):
-    """Append notices to SQLite, skipping duplicates."""
+    """Append notices to SQLite, skipping duplicates based on notice_id."""
     if not notices:
+        print("[DB] No notices to save.")
         return
 
     conn   = sqlite3.connect(db_file)
@@ -276,11 +335,11 @@ def save_to_database(notices: list, db_file: str):
             else:
                 skipped += 1
         except sqlite3.Error as e:
-            print(f"  DB error for {n.get('notice_id')}: {e}")
+            print(f"  [DB] Error for {n.get('notice_id', '?')}: {e}")
 
     conn.commit()
     conn.close()
-    print(f"\n[DB] Inserted: {inserted} new | Skipped (duplicates): {skipped}")
+    print(f"[DB] Inserted: {inserted} new | Skipped (duplicates): {skipped}")
 
 
 def save_to_csv(notices: list, prefix: str):
@@ -291,7 +350,7 @@ def save_to_csv(notices: list, prefix: str):
     today    = datetime.now().strftime("%Y-%m-%d")
     filename = f"{prefix}_{today}.csv"
     pd.DataFrame(notices).to_csv(filename, index=False)
-    print(f"[CSV] Saved {len(notices)} notices to {filename}")
+    print(f"[CSV] Saved {len(notices)} notices → {filename}")
 
 
 def print_summary(notices: list):
@@ -300,45 +359,77 @@ def print_summary(notices: list):
         print("\nNo notices found for this period.")
         return
 
-    print(f"\n{'='*70}")
-    print(f" PROCUREMENT NOTICES — {datetime.now().strftime('%d %B %Y')}")
-    print(f" Total found: {len(notices)}")
-    print(f"{'='*70}\n")
+    df = pd.DataFrame(notices)
 
-    for n in notices[:10]:
-        value = ""
-        if n.get("value_high"):
-            value = f"  £{n['value_high']:,.0f}"
-        elif n.get("value_low"):
-            value = f"  £{n['value_low']:,.0f}+"
-        print(f"  [{n['source']}] {n['title'][:65]}")
-        print(f"  Buyer: {n['organisation']}{value}")
-        print(f"  Published: {n['published_date']}  |  Deadline: {n.get('deadline', 'N/A')}")
-        print(f"  {n['url']}")
+    print(f"\n{'='*70}")
+    print(f"  PROCUREMENT NOTICES — {datetime.now().strftime('%d %B %Y')}")
+    print(f"{'='*70}")
+    print(f"  Total notices      : {len(notices):,}")
+    print(f"  FTS                : {(df['source']=='FTS').sum():,}")
+    print(f"  Contracts Finder   : {(df['source']=='Contracts Finder').sum():,}")
+
+    # Notice type breakdown
+    print(f"\n  By type:")
+    for t, c in df["notice_type"].value_counts().items():
+        print(f"    {t:<28} {c:>5}")
+
+    # Value summary
+    vals = pd.to_numeric(df["value_high"], errors="coerce").dropna()
+    if not vals.empty:
+        print(f"\n  Value (where declared):")
+        print(f"    Contracts with value : {len(vals):,}")
+        print(f"    Total declared spend : £{vals.sum()/1_000_000:.1f}m")
+        print(f"    Largest contract     : £{vals.max()/1_000_000:.2f}m")
+
+    # Sample notices
+    print(f"\n  Sample notices:")
+    for n in notices[:5]:
+        value = f"  £{n['value_high']:,.0f}" if n.get("value_high") else ""
+        print(f"    [{n['source'][:2]}] {n['title'][:60]}")
+        print(f"         {n['organisation']}{value}")
+        print(f"         {n['url']}")
         print()
 
-    if len(notices) > 10:
-        print(f"  ... and {len(notices) - 10} more. See CSV or database.\n")
+    if len(notices) > 5:
+        print(f"  ... and {len(notices) - 5:,} more — see CSV or database.\n")
+    print(f"{'='*70}\n")
 
 
 def run_daily_scrape():
-    """Main entry point — call this daily."""
-    today     = datetime.now().strftime("%Y-%m-%d")
-    from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    """Main entry point — fetches all notices for the configured date range."""
+    today     = datetime.now()
+    from_date = today - timedelta(days=LOOKBACK_DAYS)
 
-    fts_notices = fetch_fts_notices(updated_from=from_date, updated_to=today)
-    cf_notices  = fetch_contracts_finder_notices(updated_from=from_date)
+    # FTS requires full datetime format
+    fts_from = from_date.strftime("%Y-%m-%dT00:00:00")
+    fts_to   = today.strftime("%Y-%m-%dT23:59:59")
+
+    # Contracts Finder uses date only
+    cf_from  = from_date.strftime("%Y-%m-%d")
+
+    print(f"\n{'='*70}")
+    print(f"  UK Procurement Scraper — {today.strftime('%d %B %Y')}")
+    print(f"  Date range: {from_date.strftime('%d %b %Y')} to {today.strftime('%d %b %Y')}")
+    print(f"  Lookback  : {LOOKBACK_DAYS} day(s)")
+    print(f"  Keywords  : {'ALL notices' if not KEYWORDS else ', '.join(KEYWORDS)}")
+    print(f"{'='*70}")
+
+    # Fetch from both sources — full pagination
+    fts_notices = fetch_fts_notices(fts_from, fts_to)
+    cf_notices  = fetch_contracts_finder_notices(cf_from)
 
     all_notices = fts_notices + cf_notices
-    print(f"\n[Total] {len(all_notices)} notices fetched from both sources")
+    print(f"\n[Total] {len(all_notices):,} notices fetched from both sources")
 
+    # Optional keyword filter
     if KEYWORDS:
         filtered = filter_by_keywords(all_notices, KEYWORDS)
-        print(f"[Filter] {len(filtered)} notices match keywords")
+        print(f"[Filter] {len(filtered):,} notices match keywords")
     else:
         filtered = all_notices
-        print("[Filter] No keyword filter — keeping all notices")
+        print(f"[Filter] No keyword filter — keeping all {len(filtered):,} notices")
 
+    # Save
     save_to_database(filtered, DB_FILE)
     save_to_csv(filtered, CSV_PREFIX)
     print_summary(filtered)
@@ -347,19 +438,20 @@ def run_daily_scrape():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BONUS: Query your database
+# BONUS: Query the database
 # ─────────────────────────────────────────────────────────────────────────────
 
-def query_database(keyword=None, min_value=None, limit=20):
+def query_database(keyword=None, min_value=None, notice_type=None, limit=50):
     """
-    Query your local database after a few days of running.
+    Query your growing local database.
 
-    Example:
+    Examples:
         df = query_database(keyword="AI", min_value=500000)
-        print(df)
+        df = query_database(notice_type="tender")
+        df = query_database(keyword="digital", limit=100)
     """
-    conn  = sqlite3.connect(DB_FILE)
-    query = "SELECT title, organisation, value_high, published_date, url FROM notices WHERE 1=1"
+    conn   = sqlite3.connect(DB_FILE)
+    query  = "SELECT * FROM notices WHERE 1=1"
     params = []
 
     if keyword:
@@ -368,6 +460,9 @@ def query_database(keyword=None, min_value=None, limit=20):
     if min_value:
         query += " AND value_high >= ?"
         params.append(min_value)
+    if notice_type:
+        query += " AND notice_type = ?"
+        params.append(notice_type)
 
     query += " ORDER BY published_date DESC LIMIT ?"
     params.append(limit)
